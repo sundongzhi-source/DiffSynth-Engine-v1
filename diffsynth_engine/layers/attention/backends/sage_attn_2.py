@@ -28,8 +28,8 @@ class SageAttention2Backend(AttentionBackend):
             raise RuntimeError(error_msg)
 
     @staticmethod
-    def get_type() -> AttentionType:
-        return AttentionType.SAGE2
+    def get_type() -> str:
+        return str(AttentionType.SAGE2)
 
     @staticmethod
     def get_impl_cls() -> type["AttentionImpl"]:
@@ -38,6 +38,10 @@ class SageAttention2Backend(AttentionBackend):
     @staticmethod
     def get_supported_head_sizes() -> list[int]:
         return [32, 64, 96, 128, 160, 192, 224, 256]
+
+    @classmethod
+    def supports_ring_attention(cls) -> bool:
+        return True
 
 
 class SageAttention2Impl(AttentionImpl):
@@ -63,6 +67,7 @@ class SageAttention2Impl(AttentionImpl):
         max_seqlen_q: int | None = None,
         max_seqlen_k: int | None = None,
         attn_metadata: AttentionMetadata | None = None,
+        **kwargs,
     ) -> torch.Tensor:
         query = rearrange(query, "b s n d -> b n s d")
         key = rearrange(key, "b s n d -> b n s d")
@@ -90,3 +95,33 @@ class SageAttention2Impl(AttentionImpl):
             )
         output = rearrange(output, "b n s d -> b s n d")
         return output
+
+    def forward_with_lse(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        cu_seqlens_q: torch.Tensor | None = None,
+        cu_seqlens_k: torch.Tensor | None = None,
+        max_seqlen_q: int | None = None,
+        max_seqlen_k: int | None = None,
+        attn_metadata: AttentionMetadata | None = None,
+        **kwargs,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        query = rearrange(query, "b s n d -> b n s d")
+        key = rearrange(key, "b s n d -> b n s d")
+        value = rearrange(value, "b s n d -> b n s d")
+
+        if cu_seqlens_q is not None:
+            raise NotImplementedError("sageattn_varlen can not return lse.")
+        else:
+            output, lse = sageattn(
+                query,
+                key,
+                value,
+                is_causal=self.causal,
+                sm_scale=self.softmax_scale,
+                return_lse=True,
+            )
+        output = rearrange(output, "b n s d -> b s n d")
+        return output, lse

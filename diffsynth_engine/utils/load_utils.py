@@ -5,8 +5,17 @@ import time
 from typing import Any, Dict, Optional
 
 import torch
-import torch.distributed as dist
+import torch.nn as nn
 
+from diffsynth_engine.distributed.parallel_state import (
+    get_global_rank,
+    get_tensor_model_parallel_world_size,
+    get_world_group,
+    is_tp_group_initialized,
+    is_world_group_initialized,
+)
+from diffsynth_engine.layers.tensor_parallel.linear import ColumnParallelLinear, RowParallelLinear
+from diffsynth_engine.layers.tensor_parallel.norm import TensorParallelRMSNorm
 from diffsynth_engine.utils import logging
 from diffsynth_engine.utils.constants import (
     DIFFUSION_SAFETENSORS_INDEX_NAME,
@@ -28,7 +37,7 @@ except ImportError:
 
 
 def load_safetensors(path: str, device: str = "cpu") -> Dict[str, Any]:
-    is_rank_zero = not dist.is_initialized() or dist.get_rank() == 0
+    is_rank_zero = not is_world_group_initialized() or get_global_rank() == 0
     start_time = time.perf_counter()
     if FAST_SAFETENSORS_AVAILABLE:
         if is_rank_zero:
@@ -36,7 +45,8 @@ def load_safetensors(path: str, device: str = "cpu") -> Dict[str, Any]:
         num_threads = int(os.environ.get("FAST_SAFETENSORS_NUM_THREADS", 16))
         direct_io = os.environ.get("FAST_SAFETENSORS_DIRECT_IO", "False").upper() == "TRUE"
         state_dict = load_file(path, num_threads=num_threads, direct_io=direct_io)
-        state_dict = {k: v.to(device=device) for k, v in state_dict.items()}
+        for k, v in state_dict.items():
+            state_dict[k] = v.to(device=device, non_blocking=True)
     else:
         if is_rank_zero:
             logger.info(f"Safetensors loading model from {path}...")
@@ -47,49 +57,140 @@ def load_safetensors(path: str, device: str = "cpu") -> Dict[str, Any]:
     return state_dict
 
 
+def _list_shard_files(path: str) -> list[str]:
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"Model path not found: {path}")
+
+    diffusion_index = os.path.join(path, DIFFUSION_SAFETENSORS_INDEX_NAME)
+    diffusion_weights = os.path.join(path, DIFFUSION_SAFETENSORS_WEIGHTS_NAME)
+    generic_index = os.path.join(path, SAFETENSORS_INDEX_NAME)
+    generic_weights = os.path.join(path, SAFETENSORS_WEIGHTS_NAME)
+
+    if os.path.exists(diffusion_index):
+        index_file = diffusion_index
+    elif os.path.exists(diffusion_weights):
+        return [diffusion_weights]
+    elif os.path.exists(generic_index):
+        index_file = generic_index
+    elif os.path.exists(generic_weights):
+        return [generic_weights]
+    else:
+        raise FileNotFoundError(f"Safetensors index or weights file not found in {path}")
+
+    with open(index_file, "r", encoding="utf-8") as file:
+        index_dict = json.load(file)
+    shard_files = sorted(set(index_dict["weight_map"].values()))
+    if not shard_files:
+        raise ValueError(f"Weight index {index_file} contains an empty weight_map")
+    return [os.path.join(path, name) for name in shard_files]
+
+
+# tensor parallel
+
+
+def _slice_tensor(
+    tensor: torch.Tensor,
+    name: str,
+    span: tuple[int, int, int],
+) -> torch.Tensor:
+    dim, start, length = span
+    if dim < 0 or dim >= tensor.dim():
+        raise ValueError(f"Cannot shard '{name}' shape={tuple(tensor.shape)} along dim {dim}.")
+    if start < 0 or length < 0 or start + length > tensor.shape[dim]:
+        raise ValueError(
+            f"Invalid shard for '{name}' shape={tuple(tensor.shape)}: dim={dim}, start={start}, length={length}."
+        )
+
+    return tensor.narrow(dim, start, length).contiguous()
+
+
+def _slice_tensor_parallel_weights(
+    model: nn.Module,
+    state_dict: Dict[str, Any],
+) -> Dict[str, Any]:
+    tp_size = get_tensor_model_parallel_world_size() if is_tp_group_initialized() else 1
+    if tp_size <= 1:
+        return state_dict
+
+    spans: Dict[str, tuple[int, int, int]] = {}
+    for name, module in model.named_modules():
+        prefix = f"{name}." if name else ""
+
+        if isinstance(module, ColumnParallelLinear) and module.tp_size > 1:
+            start = module.tp_rank * module.out_features_per_partition
+            length = module.out_features_per_partition
+            spans[f"{prefix}weight"] = (0, start, length)
+            if module.bias is not None:
+                spans[f"{prefix}bias"] = (0, start, length)
+        elif isinstance(module, RowParallelLinear) and module.tp_size > 1:
+            start = module.tp_rank * module.in_features_per_partition
+            length = module.in_features_per_partition
+            spans[f"{prefix}weight"] = (1, start, length)
+        elif isinstance(module, TensorParallelRMSNorm) and module.tp_size > 1 and module.weight is not None:
+            start = module.tp_rank * module.hidden_size_per_partition
+            length = module.hidden_size_per_partition
+            spans[f"{prefix}weight"] = (0, start, length)
+
+    for name, tensor in state_dict.items():
+        span = spans.get(name)
+        if span is not None:
+            state_dict[name] = _slice_tensor(tensor, name, span)
+
+    return state_dict
+
+
 def load_model_weights(
     model_path: str,
     subfolder: Optional[str] = None,
     device: Optional[str] = None,
     dtype: Optional[torch.dtype] = None,
+    broadcast_from_rank0: bool = True,
 ) -> Dict[str, Any]:
-    if subfolder is not None:
-        model_path = os.path.join(model_path, subfolder)
+    world_group = get_world_group() if is_world_group_initialized() else None
+    is_rank_zero = world_group is None or get_global_rank() == 0
+    model_path = os.path.join(model_path, subfolder) if subfolder is not None else model_path
 
-    if not os.path.exists(model_path):
-        raise FileNotFoundError(f"Model path not found: {model_path}")
+    state_dict: Dict[str, Any] = {}
+    for shard_file in _list_shard_files(model_path):
+        shard_dict = load_safetensors(shard_file, device=device or "cpu") if is_rank_zero else {}
 
-    _diffusion_index_file = os.path.join(model_path, DIFFUSION_SAFETENSORS_INDEX_NAME)
-    _diffusion_weights_file = os.path.join(model_path, DIFFUSION_SAFETENSORS_WEIGHTS_NAME)
-    _index_file = os.path.join(model_path, SAFETENSORS_INDEX_NAME)
-    _weights_file = os.path.join(model_path, SAFETENSORS_WEIGHTS_NAME)
+        if world_group is not None and broadcast_from_rank0:
+            shard_dict = world_group.broadcast_tensor_dict(shard_dict, src=0)
 
-    index_file, weights_file = None, None
+        for name, tensor in shard_dict.items():
+            if isinstance(tensor, torch.Tensor):
+                shard_dict[name] = tensor.to(dtype=dtype, non_blocking=True)
+        state_dict.update(shard_dict)
 
-    if os.path.exists(_diffusion_index_file):
-        index_file = _diffusion_index_file
-    elif os.path.exists(_diffusion_weights_file):
-        weights_file = _diffusion_weights_file
-    elif os.path.exists(_index_file):
-        index_file = _index_file
-    elif os.path.exists(_weights_file):
-        weights_file = _weights_file
-    else:
-        raise FileNotFoundError(f"Safetensors index or weights file not found in {model_path}")
+    return state_dict
 
-    if index_file is not None:
-        with open(index_file, "r", encoding="utf-8") as f:
-            index_dict = json.load(f)
-        weight_map = index_dict["weight_map"]
-        shard_files = sorted(set(weight_map.values()))
-        state_dict = {}
-        for shard_file in shard_files:
-            shard_file = os.path.join(model_path, shard_file)
-            state_dict.update(load_safetensors(shard_file))
-    else:
-        state_dict = load_safetensors(weights_file)
 
-    state_dict = {k: v.to(device=device, dtype=dtype, non_blocking=True) for k, v in state_dict.items()}
+def prepare_model_weights(
+    model: nn.Module,
+    model_path: str,
+    subfolder: Optional[str] = None,
+    device: Optional[str] = None,
+    dtype: Optional[torch.dtype] = None,
+    broadcast_from_rank0: bool = True,
+) -> Dict[str, Any]:
+    world_group = get_world_group() if is_world_group_initialized() else None
+    is_rank_zero = world_group is None or get_global_rank() == 0
+    model_path = os.path.join(model_path, subfolder) if subfolder is not None else model_path
+
+    state_dict: Dict[str, Any] = {}
+    for shard_file in _list_shard_files(model_path):
+        shard_dict = load_safetensors(shard_file, device=device or "cpu") if is_rank_zero else {}
+
+        if world_group is not None and broadcast_from_rank0:
+            shard_dict = world_group.broadcast_tensor_dict(shard_dict, src=0)
+
+        shard_dict = _slice_tensor_parallel_weights(model, shard_dict)
+
+        for name, tensor in shard_dict.items():
+            if isinstance(tensor, torch.Tensor):
+                shard_dict[name] = tensor.to(dtype=dtype, non_blocking=True)
+        state_dict.update(shard_dict)
+
     return state_dict
 
 

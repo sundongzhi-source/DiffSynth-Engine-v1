@@ -29,8 +29,8 @@ class AiterBackend(AttentionBackend):
             raise RuntimeError(error_msg)
 
     @staticmethod
-    def get_type() -> AttentionType:
-        return AttentionType.AITER
+    def get_type() -> str:
+        return str(AttentionType.AITER)
 
     @staticmethod
     def get_impl_cls() -> type["AttentionImpl"]:
@@ -60,6 +60,7 @@ class AiterImpl(AttentionImpl):
         key: torch.Tensor,
         value: torch.Tensor,
         attn_metadata: AttentionMetadata | None = None,
+        **kwargs,
     ) -> torch.Tensor:
         output = aiter_flash_attn(
             query,
@@ -70,11 +71,29 @@ class AiterImpl(AttentionImpl):
         )
         return output
 
+    def forward_with_lse(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        attn_metadata: AttentionMetadata | None = None,
+        **kwargs,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        output, lse = aiter_flash_attn(
+            query,
+            key,
+            value,
+            causal=self.causal,
+            softmax_scale=self.softmax_scale,
+            return_lse=True,
+        )
+        return output, lse
+
 
 class AiterFP8Backend(AiterBackend):
     @staticmethod
-    def get_type() -> AttentionType:
-        return AttentionType.AITER_FP8
+    def get_type() -> str:
+        return str(AttentionType.AITER_FP8)
 
     @staticmethod
     def get_impl_cls() -> type["AttentionImpl"]:
@@ -88,6 +107,7 @@ class AiterFP8Impl(AiterImpl):
         key: torch.Tensor,
         value: torch.Tensor,
         attn_metadata: AttentionMetadata | None = None,
+        **kwargs,
     ) -> torch.Tensor:
         # TODO: scaling
         original_dtype = query.dtype
@@ -103,3 +123,28 @@ class AiterFP8Impl(AiterImpl):
         )
         output = output.to(original_dtype)
         return output
+
+    def forward_with_lse(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        attn_metadata: AttentionMetadata | None = None,
+        **kwargs,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        # TODO: scaling
+        original_dtype = query.dtype
+        query = query.to(DTYPE_FP8)
+        key = key.to(DTYPE_FP8)
+        value = value.to(DTYPE_FP8)
+        output, lse = aiter_flash_attn_fp8(
+            query,
+            key,
+            value,
+            causal=self.causal,
+            softmax_scale=self.softmax_scale,
+            return_lse=True,
+        )
+        output = output.to(original_dtype)
+        lse = lse.to(original_dtype)
+        return output, lse

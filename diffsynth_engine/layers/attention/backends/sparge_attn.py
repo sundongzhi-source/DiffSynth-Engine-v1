@@ -44,8 +44,8 @@ class SpargeAttentionBackend(AttentionBackend):
             raise RuntimeError(error_msg)
 
     @staticmethod
-    def get_type() -> AttentionType:
-        return AttentionType.SPARGE
+    def get_type() -> str:
+        return str(AttentionType.SPARGE)
 
     @staticmethod
     def get_impl_cls() -> type["AttentionImpl"]:
@@ -84,6 +84,7 @@ class SpargeAttentionImpl(AttentionImpl):
         value: torch.Tensor,
         attn_mask: torch.Tensor | None = None,
         attn_metadata: SpargeAttentionMetadata | None = None,
+        **kwargs,
     ) -> torch.Tensor:
         query = rearrange(query, "b s n d -> b n s d")
         key = rearrange(key, "b s n d -> b n s d")

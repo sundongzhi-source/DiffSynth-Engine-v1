@@ -3,18 +3,20 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+from __future__ import annotations
+
 from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Optional
 
 if TYPE_CHECKING:
-    from diffsynth_engine.layers.attention import AttentionMetadata, AttentionType
+    from diffsynth_engine.layers.attention import AttentionMetadata
 
 
 @dataclass
 class ForwardContext:
-    attn_metadata: Optional["AttentionMetadata"] = None
-    attn_type: Optional["AttentionType"] = None
+    attn_metadata: Optional[AttentionMetadata] = None
+    attn_type: Optional[str] = None
 
 
 _forward_context: ForwardContext | None = None
@@ -42,8 +44,8 @@ def override_forward_context(forward_context: Optional[ForwardContext] = None):
 
 @contextmanager
 def set_forward_context(
-    attn_metadata: Optional["AttentionMetadata"] = None,
-    attn_type: Optional["AttentionType"] = None,
+    attn_metadata: Optional[AttentionMetadata] = None,
+    attn_type: Optional[str] = None,
 ):
     """A context manager to that stores the current forward context."""
     forward_context = ForwardContext(
